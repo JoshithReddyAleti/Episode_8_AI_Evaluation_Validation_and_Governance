@@ -1,0 +1,4 @@
+[
+  {"query": "What is faithfulness in RAG evaluation?", "expected_context_keywords": ["claims", "supported", "context"], "expected_answer_facts": ["measures grounding", "prevents hallucination"]},
+  {"query": "Explain context precision", "expected_context_keywords": ["relevant", "retrieved", "chunks"], "expected_answer_facts": ["ratio", "relevance"]}
+]
