@@ -1,165 +1,289 @@
-# RAG Evaluation — Frontier-Lab Depth
+# RAG Evaluation — Frontier-Lab Depth (Metrics · Measurement · Production Thresholds)
 
 > Episode 8 · AI Evaluation, Validation & Governance — AI Engineering Roadmap 2026
 >
-> Frontier RAG eval is a **causal decomposition problem**: a final answer is a function of retrieval AND generation, and you must attribute quality (and blame) to the right stage with statistically valid estimators. This file gives the ranking-metric mechanisms, the grounding estimators, the counterfactual isolation protocol, and the frontier measurement machinery (ARES-style fine-tuned judges + prediction-powered inference).
+> All formulas are written in plain monospaced blocks so they render in **any** markdown viewer (GitHub, VS Code, mobile) — no LaTeX required. For each metric you get: **what is measured → how it's measured → which metrics to watch → the strategy to measure it → the production target/alert threshold.**
 
-> ⚠️ **Citations** from memory; framework metric definitions (RAGAS/ARES) evolve — verify before publishing.
+> ⚠️ **Two caveats.** (1) Citations (author + year) are from memory — verify before publishing. (2) The production target numbers below are **typical starting ranges**, not universal constants. Always calibrate to your **baseline**, your **risk tier**, and **human performance** on the task. Treat them as where to start a conversation, not law.
 
 ---
 
 ## 0 · The causal chain (why RAG eval ≠ LLM eval)
 
-$$
-\text{answer}=g\big(\text{query},\ \underbrace{r(\text{query},\text{corpus})}_{\text{retrieved context}}\big)
-$$
+A RAG answer is produced by two stages, and quality confounds both:
 
-Answer quality confounds two stages. A correct answer can come from (a) good retrieval + faithful generation, or (b) **bad retrieval + the model's parametric memory** — which looks fine on your eval and *silently fails the day the corpus changes*. Frontier eval therefore never reports only end-to-end; it **isolates** $r$ and $g$ (§4) so every number is attributable.
+```
+answer = generate( query , retrieve(query, corpus) )
+                              └─ retrieved context ─┘
+```
 
-The RAG triad: **context relevance** (is $r$ good?), **faithfulness/groundedness** (did $g$ use $r$?), **answer relevance/correctness** (is the output right?).
+A correct answer can come from (a) good retrieval + faithful generation, OR (b) **bad retrieval + the model's parametric memory** — which looks fine on your eval and silently fails the day the corpus changes. So frontier RAG eval never reports only end-to-end; it **isolates** retrieval and generation (§4) so every number is attributable to a stage.
+
+The **RAG triad** you monitor:
+
+```
+context relevance  → is retrieval good?          (retriever)
+faithfulness       → did generation use context? (generator)
+answer relevance   → did it answer the question?  (end-to-end)
+```
 
 ---
 
-## 1 · Retrieval metrics — mechanism and exact formula
+## 1 · Retrieval metrics
 
-Setup: per query, a set of **relevant** items (qrels, human-labeled or golden). Retriever returns ranked top-$k$.
+**What is measured (this whole group):** the *ranking quality* of the retriever — did the evidence needed to answer land in the top-k chunks fed to the generator, and how high?
+**How it's measured:** per query you need a set of **relevant** items (the "qrels" — from human labeling or a golden set); you compare the retriever's ranked top-k against them.
 
-### 1.1 Precision@k / Recall@k
-$$
-P@k=\frac{|\text{rel}\cap\text{top-}k|}{k},\qquad R@k=\frac{|\text{rel}\cap\text{top-}k|}{|\text{rel}|}
-$$
-**Mechanism/priority:** for RAG, **Recall@k is usually the binding constraint** — if the needed chunk isn't in the top-$k$ fed to the generator, no generation quality can recover it. Precision@k matters second (noise dilutes the context and, in long context, triggers "lost in the middle"). Track the **recall–k curve** to choose $k$: the knee is where extra chunks stop adding recall and start adding noise/cost.
+### 1.1 Precision@k and Recall@k
 
-### 1.2 MRR — first-relevant position
-$$
-\text{MRR}=\frac1{|Q|}\sum_{q}\frac{1}{\text{rank}_q}
-$$
-$\text{rank}_q$=rank of the *first* relevant item (→0 if none). Right metric when **one** good chunk suffices (factoid QA).
+```
+                 (# relevant items in top-k)
+Precision@k  =   ---------------------------
+                             k
 
-### 1.3 MAP — quality of the whole ranking
-$$
-\text{AP}=\frac{\sum_{k}P@k\cdot\text{rel}(k)}{|\text{rel}|},\qquad \text{MAP}=\frac1{|Q|}\sum_q \text{AP}_q
-$$
-$\text{rel}(k)\in\{0,1\}$. Rewards ranking **all** relevant items high — the metric for multi-hop where several chunks are needed.
+                 (# relevant items in top-k)
+Recall@k     =   ---------------------------
+                    (total # relevant items)
+```
+
+- **Precision@k** = of the k you retrieved, how many were relevant → measures **context noise**.
+- **Recall@k** = of all relevant items, how many made the top-k → measures **evidence coverage**.
+- **Which to watch:** for RAG, **Recall@k is the binding constraint** — if the needed chunk isn't in the top-k, no generation quality can recover it. Precision@k is second (noise dilutes context and triggers "lost in the middle").
+- **Strategy:** plot the **recall–k curve** and pick k at the *knee* — where extra chunks stop adding recall and start adding cost/noise.
+- **Prod target (starting ranges):** Recall@k (at the k you actually feed the generator) **≥ 0.90** for factoid QA, **≥ 0.95** for high-stakes; alert if it drops **> 5 pp below baseline** (corpus/embedding drift). Precision@k tolerance is looser (**≥ 0.5–0.7**) since the generator can ignore some noise.
+
+### 1.2 MRR — Mean Reciprocal Rank (position of first relevant)
+
+```
+              1        1
+MRR   =  ---------- · Sum  ------
+          |queries|   q    rank_q
+
+rank_q = rank of the FIRST relevant item for query q  (→ 0 if none found)
+```
+
+- **What/which:** rewards putting *a* relevant chunk near the top. Right metric when **one** good chunk suffices (factoid).
+- **Prod target:** **≥ 0.7–0.8** typical for well-tuned factoid retrieval; calibrate to baseline.
+
+### 1.3 MAP — Mean Average Precision (whole-ranking quality)
+
+```
+              Sum_k [ Precision@k · rel(k) ]
+AP        =   -----------------------------      rel(k) = 1 if item at rank k is relevant, else 0
+                   (total # relevant)
+
+               1
+MAP       =  ------ · Sum   AP_q
+             |Q|        q
+```
+
+- **What/which:** rewards ranking **all** relevant items high — the metric for **multi-hop** where several chunks are needed. Watch this (not MRR) when answers require synthesizing multiple sources.
 
 ### 1.4 NDCG@k — graded relevance + position discount (the gold standard)
-$$
-\text{DCG@}k=\sum_{i=1}^{k}\frac{2^{\text{rel}_i}-1}{\log_2(i+1)},\qquad \text{NDCG@}k=\frac{\text{DCG@}k}{\text{IDCG@}k}\in[0,1]
-$$
-**Every term:** the $2^{\text{rel}_i}-1$ gain makes highly-relevant chunks worth exponentially more than marginal ones; the $\log_2(i+1)$ discount encodes "users/generators attend to the top"; IDCG (DCG of the perfect ordering) normalizes so NDCG∈[0,1] and is comparable across queries with different numbers of relevant items. Use whenever relevance is graded (0/1/2/3), which is the realistic case.
 
-### 1.5 Reference-free retrieval quality (no qrels)
-- **Context Precision** (RAGAS-style): an LLM/NLI judge marks each retrieved chunk relevant/not; a precision@k weighted by the *positions* of relevant chunks rewards good ordering.
-- **Context Recall** (needs a reference answer): fraction of reference-answer statements *attributable* to the retrieved context:
-$$
-\text{ContextRecall}=\frac{|\text{ref-answer sentences supported by retrieved ctx}|}{|\text{ref-answer sentences}|}
-$$
-This is the reference-free proxy for "did we retrieve enough to answer."
+```
+              k        2^(rel_i) - 1
+DCG@k   =    Sum     ----------------          rel_i = graded relevance of item at rank i (e.g. 0,1,2,3)
+             i=1        log2(i + 1)
+
+              DCG@k
+NDCG@k  =   ---------          in [0, 1]        IDCG@k = DCG@k of the PERFECT ranking (ideal order)
+             IDCG@k
+```
+
+- **How / every term:** the gain `2^(rel_i) - 1` makes a highly-relevant chunk worth exponentially more than a marginally-relevant one; the discount `log2(i+1)` encodes "items near the top matter more" (a relevant chunk at rank 1 counts far more than at rank 10); dividing by IDCG (the score of the perfectly-sorted list) normalizes to [0,1] so queries with different numbers of relevant items are comparable.
+- **Which:** use whenever relevance is **graded** (0/1/2/3), which is the realistic case. This is the retrieval metric frontier teams report first.
+- **Prod target:** **≥ 0.8** is strong for graded relevance; alert on a significant drop vs baseline.
+
+### 1.5 Reference-free retrieval quality (no human qrels — for production)
+
+```
+Context Precision (RAGAS-style):
+   an LLM/NLI judge marks each retrieved chunk relevant / not,
+   weighted by the POSITIONS of the relevant chunks (rewards good ordering)
+
+                     (# reference-answer sentences supported by retrieved context)
+Context Recall  =   -------------------------------------------------------------
+                             (total # reference-answer sentences)
+```
+
+- **Strategy:** these need no qrels, so they're what you run **online** (where you have no gold ranking). Context Recall is the reference-free proxy for "did we retrieve enough to answer."
+- **Prod target:** Context Recall **≥ 0.85**, Context Precision **≥ 0.7**; both calibrated to baseline.
 
 ---
 
-## 2 · Grounding metrics — did the generator use the evidence
+## 2 · Generation / grounding metrics
 
-The question is **not** world-truth (that's §3) but whether $g$ stayed faithful to $r$.
+**What is measured:** NOT world-truth (that's §3) but whether the generator stayed **faithful to the context it was given**.
 
-### 2.1 Faithfulness / groundedness (claim-level NLI)
-Pipeline: (1) decompose the answer into atomic **claims**; (2) for each claim $c$, run NLI against the retrieved context $S$; (3) score:
-$$
-\text{Faithfulness}=\frac{|\{c:\ S\models c\}|}{|\{c\}|},\qquad \text{ungrounded rate}=1-\text{Faithfulness}
-$$
-$S\models c$ = "$S$ entails $c$" ($P_{\text{NLI}}(\text{entail}\mid S,c)>\tau$). This is the metric that catches "retrieved well, then hallucinated." The claim-decomposition step is what makes it *fine-grained* — a response-level yes/no misses the single fabricated sentence in an otherwise-grounded answer.
+### 2.1 Faithfulness / groundedness (the hallucination guard)
 
-### 2.2 Answer relevance (did it answer the question?)
-RAGAS operationalizes it by generating $n$ questions *from the answer* and measuring similarity to the original:
-$$
-\text{AnswerRelevance}=\frac1n\sum_{i=1}^n\cos\big(E(q),E(q_i')\big)
-$$
-Low ⇒ the answer drifted, hedged, or padded (faithful but useless).
+**How it's measured (pipeline):** (1) decompose the answer into atomic **claims**; (2) for each claim, run NLI entailment against the retrieved context; (3) score.
 
-### 2.3 Context utilization & noise sensitivity
-- **Utilization:** of relevant retrieved chunks, how many the answer used (detects "retrieved it, ignored it").
-- **Noise sensitivity:** inject irrelevant chunks; measure quality drop. A robust generator ignores distractors — critical because real retrieval always returns some noise. Also test **position robustness** ("lost in the middle": accuracy vs where in the context the gold chunk sits).
+```
+                    (# claims entailed by retrieved context)
+Faithfulness  =    ----------------------------------------
+                            (total # claims)
+
+ungrounded rate = 1 - Faithfulness
+
+"entailed" = NLI(entailment | context, claim) > threshold τ
+```
+
+- **Which / why:** this catches "retrieved well, then made something up." The claim-decomposition is what makes it *fine-grained* — a response-level yes/no misses the one fabricated sentence in an otherwise-grounded answer. Use **3-way NLI** (entail / neutral / contradict) so *contradiction* (intrinsic) and *neutral* (extrinsic) are separable — different bugs.
+- **Strategy:** run continuously on **sampled production traffic** — a faithfulness drop is the **earliest hallucination signal** you have.
+- **Prod target:** Faithfulness **≥ 0.90** general, **≥ 0.95–0.98** for enterprise-knowledge / regulated; **alert if it drops > 3 pp** from baseline or below 0.85.
+
+### 2.2 Answer Relevance (did it answer the question?)
+
+**How:** generate n questions *from the answer*, measure their similarity back to the original question.
+
+```
+                       1
+AnswerRelevance  =    --- · Sum   cosine( E(q) , E(q_i') )
+                       n     i
+
+E(·)   = embedding
+q      = original question
+q_i'   = i-th question generated from the answer
+```
+
+- **Which:** low score ⇒ the answer drifted, hedged, or padded (faithful but useless).
+- **Prod target:** **≥ 0.85**; watch for drops when prompts or models change.
+
+### 2.3 Context utilization & robustness (strategies, not single numbers)
+
+- **Utilization:** of the relevant retrieved chunks, how many the answer used (detects "retrieved it, ignored it").
+- **Noise sensitivity:** inject irrelevant chunks, measure the quality drop — a robust generator ignores distractors (real retrieval always returns noise).
+- **Position robustness ("lost in the middle"):** measure accuracy vs *where* in the context the gold chunk sits; frontier models still degrade for mid-context evidence, so put the best chunks at the edges.
 
 ---
 
 ## 3 · End-to-end answer quality
 
-$$
-\text{AnswerCorrectness}=w_1\cdot F1_{\text{claims}}+w_2\cdot\text{SemSim}(a,a_{\text{gold}})
-$$
-$F1_{\text{claims}}$ over claim TP/FP/FN (in both = TP, answer-only = FP, gold-only = FN); SemSim = BERTScore/cosine. **Report the components**, not the blend — factual-F1 and semantic-sim fail differently. Add a validated **pairwise judge win-rate** vs a baseline RAG config for holistic quality.
+```
+AnswerCorrectness = w1 · F1_claims + w2 · SemSim(answer, gold_answer)
+
+F1_claims: over claim TP/FP/FN
+   TP = claim in both answer and gold
+   FP = claim in answer only        (commission error)
+   FN = claim in gold only          (omission error)
+SemSim = BERTScore or embedding cosine
+```
+
+- **Strategy:** **report the components, not the blend** — factual-F1 (is it right?) and semantic-sim (does it read like the gold?) fail differently. Add a **validated pairwise judge win-rate** vs a baseline RAG config for holistic quality.
 
 ---
 
-## 4 · The isolation protocol — the frontier core
+## 4 · The isolation protocol (the frontier core — cut the causal chain)
 
-This is what the shallow treatment skipped. You must **cut the causal chain** and measure each stage against a counterfactual.
+You must measure each stage against a **counterfactual**, or you can't attribute a regression.
 
-### 4.1 Measure retrieval alone
-Feed golden queries → Recall@k, NDCG, MRR against qrels. **Low recall ⇒ fix retrieval first** (chunking size/overlap, embedding model, hybrid BM25+dense, reranker, $k$). No prompt change fixes a chunk that was never retrieved.
+**4.1 Retrieval alone** — feed golden queries → Recall@k / NDCG / MRR vs qrels. Low recall ⇒ **fix retrieval first** (chunk size/overlap, embedding model, hybrid BM25+dense, reranker, k). No prompt change fixes a chunk that was never retrieved.
 
-### 4.2 Measure generation at its ceiling
-Feed the generator the **golden context** (bypass the retriever) → faithfulness + answer correctness. This is the generator's *ceiling* independent of retrieval. If it's low here, the generator/prompt is the problem.
+**4.2 Generation at its ceiling** — feed the generator the **golden context** (bypass the retriever) → faithfulness + correctness. This is the generator's ceiling *independent of retrieval*. Low here ⇒ the generator/prompt is the problem.
 
-### 4.3 The retrieval tax (counterfactual)
-$$
-\text{RetrievalTax}=\underbrace{Q(g\mid \text{golden ctx})}_{\text{ceiling}}-\underbrace{Q(g\mid \text{retrieved ctx})}_{\text{actual}}
-$$
-The drop from golden→retrieved context is *exactly* the quality lost to imperfect retrieval — a clean, attributable number that tells you whether to invest in the retriever or the generator.
+**4.3 The retrieval tax (the attributable number):**
 
-### 4.4 The attribution table
+```
+RetrievalTax = Quality(generator | GOLDEN context)      ← ceiling
+             - Quality(generator | RETRIEVED context)   ← actual
+```
+
+The golden→retrieved drop is exactly the quality lost to imperfect retrieval — it tells you whether to invest in the retriever or the generator.
+
+**4.4 Attribution table:**
+
 | Symptom | Localizing metric | Culprit |
 |---|---|---|
-| Answer wrong, context had the evidence | faithfulness low | generator hallucinated |
-| Answer wrong, context had the evidence | faithfulness high, correctness low | generator reasoning |
-| Answer wrong, evidence missing from context | Recall@k low | retriever |
-| Answer padded/off-topic | answer relevance low | generator |
-| Answer contradicts context | faithfulness low (contradiction) | generator |
-| **Right answer, context recall low** | correctness high + context recall low | **retriever masked by parametric memory — will fail on fresh corpus** |
-
-That last row is the silent killer and the reason retrieval must be measured even when answers look right.
+| Answer wrong, context had the evidence | faithfulness LOW | generator hallucinated |
+| Answer wrong, context had the evidence | faithfulness high, correctness LOW | generator reasoning |
+| Answer wrong, evidence missing from context | Recall@k LOW | retriever |
+| Answer padded / off-topic | answer relevance LOW | generator |
+| Answer contradicts context | faithfulness LOW (contradiction) | generator |
+| **Right answer, context recall LOW** | correctness high + context recall low | **retriever masked by parametric memory — fails on fresh corpus** |
 
 ---
 
-## 5 · Frontier measurement machinery
+## 5 · Measurement strategy — offline, online, and in between
 
-### 5.1 Fine-tuned judges + PPI (ARES-style)
-Generic LLM judges are noisy on faithfulness. **ARES** (Saad-Falcon et al., 2023) fine-tunes lightweight judges for context-relevance / faithfulness / answer-relevance, then — crucially — corrects their bias against a small human-labeled set with **prediction-powered inference** (see `LLM_EVALUATION.md §2.4`):
-$$
-\hat\theta_{\text{PPI}}=\tfrac1N\sum f(X_i)-\tfrac1n\sum(f(X_j)-Y_j)
-$$
-So you can score faithfulness on 100k production traces with a cheap judge and still report a **statistically valid, unbiased** faithfulness rate using only a few hundred human labels. This is the current frontier for RAG metrics at scale.
+Real teams run a **layered** strategy, not one eval:
 
-### 5.2 Synthetic eval-set generation (with leakage control)
-Sample chunks → LLM generates a question answerable *only* from those chunks → source chunks = golden context, generated answer = reference. **Controls that make it valid:** verify answerability (a second model must answer from the chunks alone), filter questions answerable from parametric memory *without* the chunks (or they don't test retrieval), and human-spot-check a sample. Stratify: single-hop vs multi-hop, in-corpus vs out-of-corpus (to test "I don't know"/refusal), and temporal (post-cutoff facts that *must* come from retrieval).
+1. **Frozen offline golden set (regression gate).** A versioned, stratified set with golden answer + golden context per query. Runs in CI on every change. Blocks release on a statistically-significant regression (§7).
+2. **Shadow evaluation.** Run the *candidate* pipeline on **mirrored production traffic** (no user impact); compare faithfulness/relevance against the current pipeline before promoting.
+3. **Canary / staged rollout.** Ship to 1% → measure online metrics → expand to 5% → 25% → 100%, halting on threshold breach.
+4. **Online reference-free monitoring.** Continuously score **sampled** live traffic (1–5%) with faithfulness / context-relevance / answer-relevance (no gold needed).
+5. **Human audit loop.** Weekly, label a small sample (N ≈ 100–300) by hand; use it to **recalibrate** the automated judges (via prediction-powered inference, §6) so the online numbers stay honest.
+6. **Drift detection.** Track retrieval hit-rate and faithfulness over time on a control chart; compute a **Population Stability Index** on the query/embedding distribution:
 
-### 5.3 Statistical rigor
-Wilson/**cluster-bootstrap** CIs (cluster by source document — chunks from one doc are correlated); **paired** significance for config A vs B on the same queries; **per-slice** reporting (multi-hop recall collapses first). Power-size the eval set to the smallest recall/faithfulness delta you need to detect.
+```
+PSI = Sum_bins ( actual% - expected% ) · ln( actual% / expected% )
 
-### 5.4 Online monitoring (no gold context in prod)
-Run **reference-free** faithfulness (answer-vs-retrieved-ctx NLI), context relevance, and answer relevance continuously on sampled traffic; alert on **faithfulness drops** (earliest hallucination signal) and **retrieval hit-rate drops** (corpus/embedding drift); periodic human audit calibrates the online judges via PPI.
-
----
-
-## 6 · Quick-reference
-
-| Metric | Stage | Answers | Priority |
-|---|---|---|---|
-| Recall@k | retrieval | "did the evidence get retrieved?" | ★ highest |
-| NDCG@k | retrieval | "graded relevance + position" | ★ ranking gold standard |
-| MRR / MAP | retrieval | "first-relevant / all-relevant rank" | context-dependent |
-| Precision@k | retrieval | "signal vs noise in context" | secondary |
-| Faithfulness (NLI) | generation | "did it stick to evidence?" | ★ hallucination guard |
-| Answer relevance | generation | "did it answer the question?" | high |
-| Context recall | retrieval (ref-free) | "was retrieval sufficient?" | high online |
-| Answer correctness | end-to-end | "is the final answer right?" | product metric |
-| Retrieval tax | causal | "how much quality did retrieval cost?" | ★ investment signal |
+PSI < 0.1  : no significant drift
+0.1–0.25   : moderate drift — investigate
+> 0.25     : major drift — retrain/re-index
+```
 
 ---
 
-## 7 · One-paragraph summary
+## 6 · Frontier measurement machinery (valid numbers at scale)
 
-Evaluate RAG as a **causal chain**: measure retrieval with ranking metrics (**Recall@k first**, then NDCG/MRR/MAP), generation with claim-level **faithfulness** and **answer relevance**, and end-to-end **answer correctness** — but the frontier move is to **isolate stages counterfactually** (retriever against qrels, generator against *golden* context, and the **retrieval tax** as the golden→retrieved quality drop) so every regression is attributable, catching the silent "right answer from parametric memory, bad retrieval" failure. Score at scale with **fine-tuned judges corrected by prediction-powered inference** for unbiased valid rates from few human labels, on a **leakage-controlled synthetic eval set**, with **cluster-bootstrap CIs**, paired significance, per-slice breakdowns, and reference-free faithfulness monitoring in production.
+Generic LLM judges are noisy on faithfulness. **ARES**-style (Saad-Falcon et al., 2023) fine-tunes lightweight judges for context-relevance / faithfulness / answer-relevance, then corrects their bias against a small human-labeled set with **Prediction-Powered Inference (PPI)** (Angelopoulos, Bates, et al., 2023):
+
+```
+                 1                  1
+H_ppi     =     --- Sum f(X_i)  -  --- Sum ( f(X_j) - Y_j )
+                 N   i (all N)      n   j (labeled n)
+              └ judge on everything ┘ └─ measured judge bias ─┘
+
+Var(H_ppi) ≈ Var(f)/N + Var(f - Y)/n     (tighter than human-only)
+
+f(X) = cheap judge label   Y = human label (on the small subset)
+```
+
+So you score faithfulness on 100k production traces with a cheap judge and still report a **statistically valid, unbiased** rate using only a few hundred human labels.
+
+**Synthetic eval-set generation (with leakage control):** sample chunks → LLM generates a question answerable *only* from those chunks → source chunks = golden context, generated answer = reference. Validity controls: verify answerability from the chunks alone; **discard questions answerable from parametric memory without the chunks** (they don't test retrieval); human-spot-check a sample; stratify single-hop / multi-hop / out-of-corpus (tests "I don't know") / temporal (post-cutoff facts that *must* come from retrieval).
+
+---
+
+## 7 · Statistical rigor
+
+- **Confidence interval on a rate** — use **Wilson** (not normal-approx, which underflows near 0/1):
+
+```
+            p̂ + z²/2n  ±  z · sqrt( p̂(1-p̂)/n + z²/4n² )
+Wilson =   ----------------------------------------------
+                          1 + z²/n
+```
+
+- **Cluster bootstrap** — chunks/queries from one **source document** are correlated; resample *documents*, keep them intact, or you fake precision.
+- **Paired A vs B** — same queries for both configs; paired bootstrap of per-query differences, or McNemar on per-query success. Removes query-difficulty variance → far more power.
+- **Regression gate:** block release only when the drop is **statistically significant** (CI on the difference excludes 0), not on noise.
+
+---
+
+## 8 · Production thresholds cheat-sheet (starting ranges — calibrate!)
+
+| Metric | Stage | Typical prod target | Alert / regression trigger | Cadence |
+|---|---|---|---|---|
+| Recall@k (at generator k) | retrieval | ≥ 0.90 (≥ 0.95 high-stakes) | > 5 pp below baseline | offline + drift |
+| NDCG@k | retrieval | ≥ 0.80 | significant drop vs baseline | offline |
+| MRR | retrieval | ≥ 0.7–0.8 (factoid) | — | offline |
+| Faithfulness | generation | ≥ 0.90 (≥ 0.95–0.98 regulated) | > 3 pp drop or < 0.85 | **online, continuous** |
+| Answer relevance | generation | ≥ 0.85 | drop vs baseline | online |
+| Context precision | retrieval (ref-free) | ≥ 0.7 | — | online |
+| Answer correctness | end-to-end | product-specific | CI-significant regression | offline gate |
+| Retrieval hit-rate | retrieval | ≥ baseline | drop → corpus drift | online + PSI |
+| PSI (query/embedding drift) | infra | < 0.1 | > 0.25 → re-index/retrain | daily |
+
+**How to SET a threshold (the principle):** anchor it to three things — (1) your **baseline** (never regress below the current shipped number with statistical significance); (2) your **risk tier** (regulated/medical/legal demand ≥ 0.95–0.98 faithfulness *and* human review); (3) **human performance** (don't demand super-human faithfulness the task can't support). Absolute numbers above are anchors; the *gate* is "no significant regression vs baseline, and above the tier's floor."
+
+---
+
+## 9 · One-paragraph summary
+
+Evaluate RAG as a **causal chain**: retrieval with ranking metrics (**Recall@k first**, then NDCG/MRR/MAP), generation with claim-level **faithfulness** and **answer relevance**, end-to-end **answer correctness** — but **isolate the stages counterfactually** (retriever vs qrels, generator vs *golden* context, and the **retrieval tax** as the golden→retrieved drop) so every regression is attributable, catching the silent "right answer from parametric memory" failure. Score at scale with **fine-tuned judges corrected by prediction-powered inference**, on a **leakage-controlled synthetic + human golden set**, run a **layered strategy** (frozen offline gate → shadow eval → canary → online reference-free monitoring → weekly human audit → PSI drift detection), and hold each metric to a **baseline-anchored, risk-tiered production threshold** with cluster-bootstrap, paired significance.
 
 ---
 
