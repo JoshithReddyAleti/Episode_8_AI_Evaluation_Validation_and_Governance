@@ -1,213 +1,291 @@
-# LLM Evaluation — Frontier-Lab Depth
+# LLM Evaluation — Frontier-Lab Depth (Metrics · Measurement · Production Thresholds)
 
 > Episode 8 · AI Evaluation, Validation & Governance — AI Engineering Roadmap 2026
 >
-> The frontier cut: not "here are metrics" but **the mechanism of each metric, every term in every formula, the failure mode, and the exact statistical machinery frontier labs use to turn a score into a defensible number** — Bradley-Terry/Elo, probability-weighted judging, prediction-powered inference, item-response theory, contamination tests, variance reduction.
+> Formulas in plain monospaced blocks so they render in **any** markdown viewer. For each metric: **what is measured → how → which to watch → measurement strategy → production target/alert.**
 
-> ⚠️ **Citations** (author + year) are from memory; I have no live search and can hallucinate them — verify before publishing.
-
----
-
-## 0 · The framework labs actually reason from
-
-Every eval is an **estimator of a latent quantity you can't observe directly** (true task ability, helpfulness, factuality) from a **finite noisy sample**. Frontier discipline is three questions, in order:
-
-1. **Construct validity** — does the metric measure the latent thing? (BLEU vs "translation quality")
-2. **Estimation** — the point estimate *and its sampling distribution*. A number with no variance is not a measurement.
-3. **Generalization** — does it hold off the eval set? (contamination, overfitting-to-eval, drift)
-
-Amateur eval stops at a point estimate. Frontier eval treats the score as $\hat\theta$ with a variance, a bias model, and a contamination check.
+> ⚠️ (1) Citations are from memory — verify. (2) Production numbers are **calibration starting points**, not universal constants — anchor to your baseline, risk tier, and human performance.
 
 ---
 
-## 1 · Reference-based metrics — mechanism, exact formula, failure
+## 0 · The framework labs reason from
 
-### 1.1 P / R / F1 — a decision-boundary count
-The model partitions items into predicted ±; truth partitions them into actual ±. The 2×2 counts (TP, FP, FN, TN) are the raw material.
+Every eval is an **estimator of a latent quantity you can't observe** (true ability, helpfulness, factuality) from a **finite noisy sample**. Discipline = three questions in order:
 
-$$
-P=\frac{TP}{TP+FP},\quad R=\frac{TP}{TP+FN},\quad F_\beta=(1+\beta^2)\frac{P\,R}{\beta^2 P + R}
-$$
+```
+1. Construct validity — does the metric measure the latent thing?   (BLEU vs "quality")
+2. Estimation         — point estimate AND its sampling distribution (a number with no
+                        variance is not a measurement)
+3. Generalization     — does it hold off the eval set?               (contamination, drift)
+```
 
-- **Why F1 is a *harmonic* mean:** it's dominated by the smaller of P,R, so you can't buy a high F1 by sacrificing one. Arithmetic mean scores P=1.0,R=0.02 as 0.51; F1 scores it 0.039.
-- **Macro vs micro, mechanistically:** micro pools all classes' counts *before* dividing → weights each *example* equally → dominated by frequent classes. Macro computes F1 per class then averages → weights each *class* equally → surfaces rare-class failure. The gap between them *is* the imbalance signal.
-- **Failure:** a threshold hides the ranking. When the model emits scores, report threshold-free **PR-AUC / ROC-AUC**, then pick the operating threshold off the PR curve at your required precision.
+Amateur eval stops at a point estimate. Frontier eval treats a score as `θ̂` with a variance, a bias model, and a contamination check.
+
+---
+
+## 1 · Reference-based metrics
+
+**What is measured:** agreement between model output and a **gold reference**. **How:** compare predicted vs gold via counts (classification), overlap (generation), or embeddings (semantic).
+
+### 1.1 Precision / Recall / F1 — a decision-boundary count
+
+```
+        TP                 TP                        P · R
+P  =  -------      R  =  -------      F_beta = (1+b²)·-----------
+      TP + FP            TP + FN                      b²·P + R
+
+TP true-positive  FP false-positive  FN false-negative
+F1 = F_beta with b=1
+```
+
+- **Mechanism:** F1 is a **harmonic** mean → dominated by the smaller of P,R, so you can't buy a high F1 by sacrificing one (arithmetic mean scores P=1.0,R=0.02 as 0.51; F1 scores 0.039).
+- **Macro vs micro:** *micro* pools all classes' counts before dividing → weights each **example** → dominated by frequent classes. *Macro* averages per-class F1 → weights each **class** → surfaces rare-class failure. The gap between them **is** the imbalance signal.
+- **Which to watch:** when the model emits scores, watch **PR-AUC / ROC-AUC** (threshold-free) and pick the operating threshold off the PR curve at your required precision.
+- **Prod target:** task-specific; gate on "no significant drop vs baseline." For safety classifiers, watch **recall** (missing a violation is worse than a false alarm) with a floor like ≥ 0.95.
 
 ### 1.2 BLEU — clipped precision + brevity penalty + smoothing
-Mechanism: *clipped* n-gram precision so repeating one high-frequency n-gram can't inflate the score.
 
-$$
-p_n=\frac{\sum_{c}\sum_{g}\min(\text{Count}_c(g),\text{Count}_{ref}(g))}{\sum_{c}\sum_{g}\text{Count}_c(g)},\qquad
-\text{BLEU}=BP\cdot\exp\Big(\sum_{n=1}^N w_n\log p_n\Big)
-$$
+```
+             Sum_c Sum_g  min( Count_cand(g) , Count_ref(g) )      ← the "clip"
+p_n     =   -----------------------------------------------
+                    Sum_c Sum_g  Count_cand(g)
 
-$$
-BP=\begin{cases}1 & c>r\\ e^{1-r/c}&c\le r\end{cases}
-$$
+BLEU    =   BP · exp( Sum_{n=1..N} w_n · log p_n )       w_n = 1/N  (N=4 typical)
 
-$\text{Count}_c$=candidate n-gram count; the $\min$ is the *clip*; $w_n=1/N$ (N=4 typical); $BP$ punishes too-short candidates; $c,r$=candidate/effective-reference length. **Why the log-sum matters:** any $p_n=0 \Rightarrow \log 0 \Rightarrow$ score collapses, so **sentence-BLEU requires smoothing** (Chen & Cherry, 2014). Corpus-BLEU accumulates counts across the set before dividing, so corpus-BLEU ≠ mean sentence-BLEU. **Failure:** surface-only; correct paraphrase scores low. Use for MT/constrained gen with ≥4 references; never as a sole open-ended metric.
+              | 1              if c > r
+BP      =     | exp(1 - r/c)   if c <= r          c = candidate length, r = reference length
+```
 
-### 1.3 ROUGE-L — the LCS mechanism
-Rewards the **longest common subsequence** (in-order overlap with gaps), matching how summaries reorder:
+- **Mechanism:** the `min(...)` clip stops a candidate gaming the score by repeating one high-frequency n-gram; BP punishes too-short candidates. **Any p_n = 0 ⇒ log 0 ⇒ score collapses**, so **sentence-BLEU needs smoothing** (Chen & Cherry, 2014). Corpus-BLEU accumulates counts before dividing → ≠ mean sentence-BLEU.
+- **Which/when:** MT / constrained gen with ≥4 references. **Never** the sole metric for open-ended generation (correct paraphrase scores low).
 
-$$
-R_{lcs}=\frac{LCS(X,Y)}{m},\ P_{lcs}=\frac{LCS(X,Y)}{n},\ F_{lcs}=\frac{(1+\beta^2)R_{lcs}P_{lcs}}{R_{lcs}+\beta^2 P_{lcs}}
-$$
+### 1.3 ROUGE-L — longest common subsequence
 
-$X$=reference ($m$ tokens), $Y$=candidate ($n$), $\beta$ weights recall (summarization uses large $\beta$).
+```
+          LCS(X,Y)          LCS(X,Y)              (1+b²)·R_lcs·P_lcs
+R_lcs =  ----------  P_lcs = ---------  F_lcs =  --------------------
+             m                   n                  R_lcs + b²·P_lcs
+
+X = reference (m tokens), Y = candidate (n tokens); summarization uses large b (recall-weighted)
+```
+
+LCS rewards in-order overlap **with gaps**, matching how summaries reorder.
 
 ### 1.4 BERTScore — greedy contextual matching + IDF
-Embed every token *in context* (so "bank" differs by sentence), greedily match each candidate token to its most-similar reference token by cosine, **IDF-weight** so rare informative tokens count more:
 
-$$
-R_{BERT}=\frac{\sum_{x_i}\text{idf}(x_i)\max_{\hat x_j}x_i^\top\hat x_j}{\sum_{x_i}\text{idf}(x_i)},\quad
-P_{BERT}=\frac{\sum_{\hat x_j}\text{idf}(\hat x_j)\max_{x_i}x_i^\top\hat x_j}{\sum_{\hat x_j}\text{idf}(\hat x_j)}
-$$
+```
+           Sum_i idf(x_i) · max_j ( x_i · x̂_j )
+R_bert =  ------------------------------------      (embeddings L2-normalized ⇒ dot = cosine)
+                 Sum_i idf(x_i)
 
-(embeddings L2-normalized ⇒ dot = cosine). Captures paraphrase; **cannot judge factuality** — two fluent, close sentences can both be false.
+P_bert =  same, swapping candidate/reference          F_bert = harmonic mean(P_bert, R_bert)
+```
+
+Embeds each token **in context** ("bank" differs by sentence), greedily matches by cosine, IDF-weights so rare informative tokens count more. Captures paraphrase; **cannot judge factuality** (two fluent, close sentences can both be false).
 
 ---
 
-## 2 · Model-graded evaluation — the frontier workhorse, done rigorously
+## 2 · Model-graded evaluation (LLM-as-judge) — the frontier workhorse
 
-Open-ended quality has no gold string, so labs use **LLM-as-judge**. The frontier isn't "ask a model to grade" — it's the calibration and aggregation that makes the judge a *measurement instrument*.
+**What is measured:** open-ended quality with no gold string. **How:** a strong model grades, but the frontier is the **calibration + aggregation** that makes the judge a *measurement instrument*.
 
 ### 2.1 G-Eval probability-weighted score (kills integer-clumping)
-A judge asked for 1–5 clumps on 3s/4s. G-Eval (Liu et al., 2023) reads the judge's **token probabilities** over score tokens and takes the expectation:
 
-$$
-\text{score}=\sum_{s\in\{1..5\}}p(s)\cdot s,\qquad p(s)=\frac{e^{z_s}}{\sum_{s'}e^{z_{s'}}}
-$$
+A judge asked for 1–5 clumps on 3s/4s. Read the judge's **token probabilities** over score tokens and take the expectation:
 
-$z_s$=judge logit for score token $s$. Gives a continuous score (e.g., 3.7) with far lower quantization variance — the difference between resolving a 2% gain and not.
+```
+                                          exp(z_s)
+score = Sum_{s in 1..5} p(s) · s     p(s) = -----------      z_s = judge logit for score token s
+                                          Sum_s' exp(z_s')
+```
+
+Yields a continuous score (e.g. 3.7) with far lower quantization variance — the difference between resolving a 2% gain and not.
 
 ### 2.2 Pairwise + Bradley-Terry — how leaderboards actually rank
-Relative judgments beat absolute. **Bradley-Terry** gives each model a latent strength $\beta_i$:
 
-$$
-P(i\succ j)=\frac{e^{\beta_i}}{e^{\beta_i}+e^{\beta_j}}=\sigma(\beta_i-\beta_j)
-$$
+```
+                 exp(beta_i)
+P(i beats j) = --------------------- = sigmoid(beta_i - beta_j)
+               exp(beta_i)+exp(beta_j)
 
-Fit $\{\beta_i\}$ by **MLE (logistic regression on pairwise outcomes)** — exactly how Chatbot Arena / LMSYS turns votes into a ranking. **Elo** is the online approximation:
+Fit {beta_i} by MLE (logistic regression on pairwise win/loss outcomes).   ← Chatbot Arena / LMSYS
 
-$$
-E_A=\frac{1}{1+10^{(R_B-R_A)/400}},\qquad R_A'\leftarrow R_A+K(S_A-E_A)
-$$
+Elo (online approximation):
+                    1
+   E_A = --------------------------      R_A' = R_A + K·(S_A - E_A)
+          1 + 10^((R_B - R_A)/400)       S_A in {1, 0.5, 0} = actual result
+```
 
-$E_A$=expected score, $S_A\in\{1,\tfrac12,0\}$=actual, $K$=step. (Worked: $R_A{=}1500,R_B{=}1600\Rightarrow E_A{=}0.360$; A wins ⇒ $R_A'{=}1520.5$.) **Frontier practice:** fit BT by MLE (Elo is order-dependent), put **bootstrap CIs** on $\beta_i$, claim a ranking gap only when CIs separate.
+Worked: R_A=1500, R_B=1600 → E_A=0.360; if A wins, R_A'=1520.5. **Frontier practice:** fit Bradley-Terry by MLE (Elo is order-dependent), put **bootstrap CIs** on beta_i, claim a ranking gap only when CIs separate.
 
 ### 2.3 The judge is an instrument — characterize its error
-- **Validate vs humans:** report judge precision/recall (binary) or Spearman/Kendall-τ (scores) and agreement (Cohen's κ; **Krippendorff's α** for >2 raters / missing data). Below ~0.6 κ it isn't a metric.
-- **De-bias the artifacts, mechanistically:**
-  - *Position bias* (favor first/last) → evaluate both orders, average; flip ⇒ tie.
-  - *Verbosity bias* (reward length) → length-controlled win-rate (regress out length) or length-matched pairs.
-  - *Self-preference* (favor own family) → different judge family or a **jury** of judges.
-  - *Style-over-substance* → rubric that gates on factuality separately.
 
-### 2.4 Prediction-Powered Inference (PPI) — cheap judge, *valid* number
-Human labels: unbiased, scarce. Judge labels: cheap, biased. **PPI** (Angelopoulos, Bates, et al., 2023) fuses them into an estimator **unbiased even if the judge is biased**, with a **tighter CI than human-only**. With $N$ items judged $f(X)$ and a subset $n$ having both $f(X)$ and human $Y$, for a rate/mean:
+- **Validate vs humans:** report judge precision/recall (binary) or Spearman/Kendall-τ (scores) and agreement (Cohen's κ; **Krippendorff's α** for >2 raters). **Below ~0.6 κ it isn't a metric.**
+- **De-bias the known artifacts:**
 
-$$
-\hat\theta_{\text{PPI}}=\underbrace{\tfrac1N\sum_{i=1}^{N}f(X_i)}_{\text{judge on all}}-\underbrace{\tfrac1n\sum_{j=1}^{n}(f(X_j)-Y_j)}_{\text{measured judge bias}},\quad
-\widehat{\text{Var}}\approx\frac{\text{Var}(f)}{N}+\frac{\text{Var}(f-Y)}{n}
-$$
+```
+Position bias   (favor first/last)  → evaluate BOTH orders, average; a flip ⇒ tie
+Verbosity bias  (reward length)     → length-controlled win-rate (regress out length)
+Self-preference (favor own family)  → different judge family, or a JURY of judges
+Style>substance (fluent-wrong wins) → rubric that gates factuality separately
+```
 
-The rectifier subtracts the judge's *measured* bias; variance shrinks because the judge explains most variation and you only pay $n$ for the correction. (Verified: true 0.15 → biased judge 0.166, human-only 0.150 (SE 0.021), **PPI 0.140 (SE 0.016)** — tighter *and* unbiased.) This is how a lab reports an LLM-judged metric with a valid interval instead of trusting the judge.
+### 2.4 Prediction-Powered Inference (PPI) — cheap judge, VALID number
+
+Human labels: unbiased, scarce. Judge labels: cheap, biased. PPI (Angelopoulos, Bates, et al., 2023) fuses them → **unbiased even if the judge is biased**, with a **tighter CI than human-only**:
+
+```
+          1                   1
+θ_ppi  = --- Sum f(X_i)   -  --- Sum ( f(X_j) - Y_j )
+          N   (all N)         n   (labeled n)
+       └ judge on everything ┘ └── measured judge bias ──┘
+
+Var(θ_ppi) ≈ Var(f)/N + Var(f - Y)/n         f = judge label, Y = human label
+```
+
+Verified demo: true rate 0.15 → biased judge 0.166, human-only 0.150 (SE 0.021), **PPI 0.140 (SE 0.016)** — tighter *and* unbiased. This is how a lab reports an LLM-judged metric with a valid interval.
 
 ---
 
 ## 3 · Calibration & uncertainty
 
-### 3.1 ECE done properly (binning is a footgun)
-$$
-\text{ECE}=\sum_{m=1}^{M}\frac{|B_m|}{n}\big|\text{acc}(B_m)-\text{conf}(B_m)\big|,\qquad
-\text{MCE}=\max_m\big|\text{acc}(B_m)-\text{conf}(B_m)\big|
-$$
-Equal-**width** bins leave high-confidence bins near-empty (LLMs pile near 1.0), inflating variance → use **equal-mass (adaptive)** bins; report **MCE** (worst bin) for safety routing and a **reliability diagram** (acc vs conf) to see over/under-confidence direction. **Fix miscalibration** with **temperature scaling**: divide logits by a single learned $T$ minimizing val NLL — cheap, accuracy-preserving, usually collapses ECE.
+**What is measured:** does the model's stated confidence match its actual accuracy (needed for routing/abstention)?
+
+### 3.1 ECE (binning is a footgun)
+
+```
+          M  |B_m|
+ECE  =   Sum ----- · | acc(B_m) - conf(B_m) |          MCE = max_m | acc(B_m) - conf(B_m) |
+         m=1   n
+
+B_m = the m-th confidence bin
+```
+
+Equal-**width** bins leave high-confidence bins near-empty (LLMs pile near 1.0) → inflated variance → use **equal-mass (adaptive)** bins; report **MCE** (worst bin) for safety routing and a **reliability diagram** to see over/under-confidence direction. **Fix miscalibration** with **temperature scaling**: divide logits by one learned T minimizing val NLL — cheap, accuracy-preserving, usually collapses ECE.
+- **Prod target:** ECE **< 0.05** excellent, **< 0.10** acceptable for confidence-routing; **> 0.15 → recalibrate**.
 
 ### 3.2 Brier + Murphy decomposition
-$$
-BS=\frac1N\sum_i(p_i-o_i)^2=\text{Reliability}-\text{Resolution}+\text{Uncertainty}
-$$
-One number splitting *calibration* from *discrimination* from *irreducible base-rate uncertainty*.
+
+```
+       1
+BS  = --- Sum (p_i - o_i)²  = Reliability - Resolution + Uncertainty
+       N   i                   (calibration) (discrimination) (base rate)
+
+p_i = predicted probability, o_i in {0,1} = outcome
+```
+
+One number splitting calibration from discrimination from irreducible base-rate uncertainty.
 
 ### 3.3 Semantic uncertainty
-Token entropy is weak (paraphrases split probability). The frontier signal is **semantic entropy** (cluster samples by meaning, then take entropy over meanings) — see `HALLUCINATION_HANDLING.md §2`.
+Token entropy is weak (paraphrases split probability). The frontier signal is **semantic entropy** — cluster samples by meaning first — see `HALLUCINATION_HANDLING.md §2`.
 
 ---
 
 ## 4 · Verifiable tasks — pass@k and its stable estimator
 
-Generate $n$ samples, count $c$ correct, estimate P(≥1 correct in $k$):
+**What/how:** for code/math with an executable checker, generate n samples, count c correct, estimate P(≥1 correct in k):
 
-$$
-\text{pass@}k=\mathbb E\Big[1-\frac{\binom{n-c}{k}}{\binom{n}{k}}\Big]=1-\prod_{i=n-c+1}^{n}\Big(1-\frac{k}{i}\Big)
-$$
+```
+                  C(n-c, k)                          n
+pass@k = 1 -  ---------------  =  1 -  Product   ( 1 - k/i )     ← numerically stable form
+                  C(n, k)             i=n-c+1                       (Chen et al. 2021, Codex)
+```
 
-The right form generates $n\gg k$ (low variance) vs the high-variance "generate exactly $k$" estimator; the **product form** (Chen et al., 2021, Codex) avoids binomial overflow. (Verified $n{=}200,c{=}40$: pass@1=0.200, pass@10=0.899, pass@100=1.000.) Report pass@1 for *quality*; for **reliability** report **pass^k** (all $k$ succeed) — a much harder bar mattering when users won't resample.
+The stable product form avoids binomial overflow. Verified n=200,c=40: pass@1=0.200, pass@10=0.899, pass@100=1.000. Report pass@1 for **quality**; for **reliability** report **pass^k** (ALL k succeed ≈ (c/n)^k) — the harder bar that matters when users won't resample.
 
 ---
 
 ## 5 · Generalization — what separates real labs
 
-### 5.1 Contamination detection
-- **N-gram/substring overlap:** flag eval items sharing a long n-gram (13-gram / 50-char span) with training text; report a **clean-subset** score.
-- **Min-K% Prob** (Shi et al., 2023): a memorized example has *no* very-low-prob tokens; score = mean log-prob of the K% lowest-prob tokens; abnormally high ⇒ seen.
-- **Exchangeability/canary test** (Oren et al., 2023): a contaminated model likes the benchmark's canonical order more than a shuffle — a statistical test needing no training-data access.
-- **Canary GUIDs:** authors embed a string; reproduction ⇒ leak.
+### 5.1 Contamination detection (is the test in training data?)
+
+```
+N-gram/substring overlap : flag eval items sharing a 13-gram / 50-char span with training text
+Min-K% Prob (Shi 2023)   : memorized text has NO very-low-prob tokens; score = mean log-prob of
+                           the K% lowest-prob tokens; abnormally high ⇒ seen in training
+Exchangeability (Oren 23): a contaminated model likes the benchmark's canonical order more than a
+                           shuffle — a statistical test needing no training-data access
+Canary GUIDs             : authors embed a string; reproduction ⇒ leak
+```
+
+Report a **clean-subset** score.
 
 ### 5.2 Overfitting-to-eval & Goodhart
 Keep a **held-out** slice never used for iteration; the dev↔held-out gap is your overfitting tax. Refresh eval sets — a static public benchmark decays as everyone tunes to it.
 
 ### 5.3 Item Response Theory — build discriminating eval sets
-$$
-P(\text{model }i\text{ solves item }j)=\sigma\big(a_j(\theta_i-b_j)\big)
-$$
-$\theta_i$=ability, $b_j$=difficulty, $a_j$=discrimination. Items with low $a_j$ (everyone/no-one solves) carry no signal — drop them. IRT yields a short high-discrimination set that separates frontier models better than a big random one and places new models on a stable scale.
+
+```
+P(model i solves item j) = sigmoid( a_j · ( theta_i - b_j ) )
+
+theta_i = model ability   b_j = item difficulty   a_j = item discrimination
+```
+
+Items with low a_j (everyone/no-one solves) carry **no signal** — drop them. IRT yields a short, high-discrimination set that separates frontier models better than a big random one.
 
 ---
 
 ## 6 · Statistical machinery for "we improved"
 
-### 6.1 Wilson interval for a rate (not normal-approx)
-$$
-\frac{\hat p+\frac{z^2}{2n}\pm z\sqrt{\frac{\hat p(1-\hat p)}{n}+\frac{z^2}{4n^2}}}{1+\frac{z^2}{n}}
-$$
+```
+Wilson CI for a rate (use this, not normal-approx):
 
-### 6.2 Cluster bootstrap (independence is usually false)
-If items share templates/users/documents they're correlated and plain bootstrap **understates variance**. Resample the **clusters**, keep them intact — this routinely doubles honest CIs on templated evals.
+           p̂ + z²/2n  ±  z · sqrt( p̂(1-p̂)/n + z²/4n² )
+Wilson =  ----------------------------------------------
+                        1 + z²/n
 
-### 6.3 Paired A vs B → McNemar
-Same items for both models removes item-difficulty variance (far more power). For pass/fail:
-$$
-\chi^2=\frac{(b-c)^2}{b+c}
-$$
-$b$=A-right/B-wrong, $c$=A-wrong/B-right; concordant pairs carry no comparative signal. For scores: paired bootstrap of per-item differences.
+Cluster bootstrap : items sharing templates/users/docs are correlated → resample the CLUSTERS,
+                    keep them intact (plain bootstrap fakes precision)
 
-### 6.4 Power & variance reduction
-Sample size to detect absolute gap $\Delta$:
-$$
-n\approx\frac{\big(z_{1-\alpha/2}\sqrt{2\bar p(1-\bar p)}+z_{1-\beta}\sqrt{p_1(1-p_1)+p_2(1-p_2)}\big)^2}{\Delta^2}
-$$
-**CUPED:** with a pre-experiment covariate $X$, $\hat\theta_{\text{CUPED}}=\bar Y-\gamma(\bar X-\mathbb E X)$, $\gamma=\text{Cov}(Y,X)/\text{Var}(X)$; cuts variance by $\rho^2$.
+Paired A vs B (same items) → McNemar for pass/fail:
+          (b - c)²
+   χ²  = ----------      b = A-right/B-wrong, c = A-wrong/B-right  (concordant pairs carry no signal)
+           b + c
 
----
+Sample size to detect absolute gap Δ:
+        ( z_{1-α/2}·sqrt(2·p̄(1-p̄)) + z_{1-β}·sqrt(p1(1-p1)+p2(1-p2)) )²
+   n ≈ ----------------------------------------------------------------
+                                    Δ²
 
-## 7 · The frontier protocol (end to end)
-
-1. Latent target + construct validity.
-2. Eval set: representative, stratified, multi-annotator gold (κ/α reported), **frozen & versioned**, **held-out** slice, **contamination scan**, **power-sized**.
-3. Small metric suite: reference-based where gold exists; **probability-weighted judge** elsewhere, **validated + de-biased**, reported via **PPI**.
-4. Calibration (adaptive-bin ECE + reliability diagram + temperature scaling) if you route on confidence.
-5. Estimate with uncertainty: Wilson/**cluster-bootstrap**; **paired McNemar/bootstrap** for A vs B; effect size + p-value.
-6. Generalization gate: clean-subset score, held-out gap, IRT-pruned items.
-7. CI regression gate + online monitoring on sampled live traffic.
+CUPED variance reduction: θ_cuped = Ȳ - γ·(X̄ - E[X]),  γ = Cov(Y,X)/Var(X)  → cuts variance by ρ²
+```
 
 ---
 
-## 8 · One-paragraph summary
+## 7 · Measurement strategy (offline → online)
 
-Treat every score as an **estimator of a latent quantity** and defend it on three fronts: **construct validity** (P/R/F1 mechanics, clipped-BLEU, LCS-ROUGE, IDF-BERTScore and their failure modes), **estimation** (probability-weighted LLM judges, validated and de-biased, ranked by **Bradley-Terry MLE with bootstrap CIs**, reported through **prediction-powered inference** so a cheap judge yields an unbiased tight interval; calibration via adaptive ECE + temperature scaling; verifiable tasks via numerically-stable **pass@k** and reliability via **pass^k**), and **generalization** (contamination tests — n-gram, Min-K%, exchangeability — held-out gaps, **IRT**-designed items), with all comparisons **paired (McNemar), cluster-bootstrapped, and power-analyzed**. That stack is the difference between a benchmark number and a measurement a lab will stake a launch on.
+```
+1. Frozen offline golden set → CI regression gate on every model/prompt change
+2. Shadow eval              → run candidate on mirrored traffic, compare, before promoting
+3. Canary / staged rollout  → 1% → 5% → 25% → 100%, halt on threshold breach
+4. Online sampling          → score 1–5% of live traffic with the automated suite
+5. Human audit loop (weekly)→ label N≈100–300; recalibrate auto-metrics via PPI
+6. Drift detection          → control charts on key metrics + PSI on the input distribution
+```
+
+---
+
+## 8 · Production thresholds cheat-sheet (starting ranges — calibrate!)
+
+| Metric | What it guards | Typical target | Alert / gate | Cadence |
+|---|---|---|---|---|
+| Task accuracy / F1 | correctness | no sig. drop vs baseline | CI excludes 0 on the drop | offline gate |
+| Safety-classifier recall | missed violations | ≥ 0.95 | any drop | offline + online |
+| False-refusal rate | over-refusal | ≤ 2–5% | rises with safety gains | online |
+| Judge–human κ | judge trust | ≥ 0.6 (use), ≥ 0.8 (primary) | < 0.6 → don't ship judge | pre-launch + monthly |
+| Judge position-flip rate | judge bias | < 5–10% | rising | per eval run |
+| ECE | calibration | < 0.05 (rout.), < 0.10 ok | > 0.15 → recalibrate | offline |
+| pass@1 / pass^k | quality / reliability | task-specific | sig. regression | offline gate |
+| Win-rate vs baseline | holistic quality | > 50% (CI excludes 50) | ≤ 50% | shadow + canary |
+| PSI (input drift) | distribution shift | < 0.1 | > 0.25 → re-eval/retrain | daily |
+
+**How to SET a threshold:** anchor to (1) **baseline** — never regress below the shipped number with statistical significance; (2) **risk tier** — regulated/safety-critical demand higher floors *and* human review; (3) **human performance** — don't demand a bar the task can't support. The gate is "no significant regression vs baseline, and above the tier floor," not a magic number.
+
+---
+
+## 9 · One-paragraph summary
+
+Treat every score as an **estimator of a latent quantity** and defend it on **construct validity** (P/R/F1 mechanics, clipped-BLEU, LCS-ROUGE, IDF-BERTScore + failure modes), **estimation** (probability-weighted LLM judges, validated and de-biased, ranked by **Bradley-Terry MLE with bootstrap CIs**, reported via **prediction-powered inference**; calibration via adaptive ECE + temperature scaling; **pass@k** and **pass^k**), and **generalization** (contamination tests, held-out gaps, **IRT** items) — all with **Wilson/cluster-bootstrap CIs, paired McNemar, power analysis**; then operationalize with a **layered strategy** (offline gate → shadow → canary → online sampling → weekly human audit → PSI drift) held to **baseline-anchored, risk-tiered thresholds**.
 
 ---
 
